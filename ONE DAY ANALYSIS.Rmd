@@ -1,0 +1,1397 @@
+---
+title: "Optimal Battery Dispatch via Stochastic Energy Market Modelling"
+subtitle: "OU Price - OU + Weibull Wind - Hourly Normal Load - Hourly Beta Solar"
+author: "Energy Analytics"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    toc_depth: 3
+    theme: flatly
+    highlight: tango
+    code_folding: show
+    number_sections: true
+  pdf_document:
+    toc: true
+    number_sections: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo    = TRUE,
+  warning = FALSE,
+  message = FALSE,
+  fig.align = "center",
+  fig.width = 10,
+  fig.height = 5
+)
+```
+
+---
+
+# Introduction
+
+Electricity markets are characterised by strong mean reversion in prices, heavy-tailed wind variability, and predictable diurnal patterns in load and solar output. This report develops **four stochastic models** fitted to German DE/LU hourly data for 2019:
+
+| Variable | Model |
+|----------|-------|
+| **Price** | Ornstein-Uhlenbeck (OU) mean-reverting process |
+| **Wind** | OU process (dynamics) -> Weibull distribution (marginal) |
+| **Load** | Hourly-stratified Normal distribution |
+| **Solar** | Hourly-stratified Beta distribution |
+
+Using these fitted distributions, we then formulate and solve a **24-hour battery dispatch linear program** that minimises net electricity cost while respecting battery physics.
+
+---
+
+# Data Preparation
+
+## Load Libraries
+
+```{r libraries}
+# Core packages
+library(tidyverse)    # data wrangling + ggplot2
+library(lubridate)    # datetime handling
+library(scales)       # axis formatting
+
+# Statistical modelling
+library(MASS)         # fitdistr (Weibull, Normal)
+library(fitdistrplus) # descdist, fitdist (Beta)
+library(moments)      # skewness / kurtosis
+
+# Optimisation
+library(lpSolve)      # linear programming solver
+
+# Reporting
+library(knitr)
+library(kableExtra)
+```
+
+## Read & Clean Data
+
+```{r read_data}
+# Step 1: Read raw data and drop fully empty columns left by the ",,," header fields
+raw <- read_csv(
+  "D:/ISI/SEM2/Optimisation/Project/Finalised opt dataset.csv",
+  show_col_types = FALSE
+)
+
+# Remove columns whose name is NA or blank (arises from the empty ,, fields)
+raw <- raw[ , !is.na(names(raw)) & nzchar(trimws(names(raw)))]
+
+# Confirm required columns are present
+needed <- c("utc_timestamp",
+            "DE_load_actual_entsoe_transparency",
+            "DE_LU_price_day_ahead",
+            "DE_solar_generation_actual",
+            "DE_wind_generation_actual",
+            "DE_solar_capacity",
+            "DE_wind_capacity")
+
+missing_cols <- setdiff(needed, names(raw))
+if (length(missing_cols) > 0)
+  stop("Missing columns: ", paste(missing_cols, collapse = ", "))
+
+# Step 2: Pull the six columns we need and rename them cleanly
+df <- raw %>%
+  rename(
+    timestamp     = utc_timestamp,
+    load_mw       = DE_load_actual_entsoe_transparency,
+    price_eur_mwh = DE_LU_price_day_ahead,
+    solar_mw      = DE_solar_generation_actual,
+    wind_mw       = DE_wind_generation_actual,
+    solar_cap     = DE_solar_capacity,
+    wind_cap      = DE_wind_capacity
+  ) %>%
+  dplyr::select(timestamp, load_mw, price_eur_mwh,
+                solar_mw, wind_mw, solar_cap, wind_cap) %>%
+# Step 3: Coerce to numeric values and parse timestamps
+  mutate(
+    across(-timestamp, ~ suppressWarnings(as.numeric(.x))),
+    timestamp = parse_date_time(timestamp,
+                                orders = c("m/d/Y H:M", "m/d/Y"),
+                                tz = "UTC"),
+    hour     = hour(timestamp),
+    date     = as_date(timestamp),
+    doy      = yday(timestamp),
+    solar_cf = pmax(0, pmin(1, solar_mw / solar_cap)),
+    wind_cf  = pmax(0, pmin(1, wind_mw  / wind_cap))
+  ) %>%
+# Step 4: Remove rows with missing values in the key variables
+  filter(
+    !is.na(price_eur_mwh),
+    !is.na(load_mw),
+    !is.na(solar_mw),
+    !is.na(wind_mw),
+    !is.na(solar_cap),
+    !is.na(wind_cap),
+    solar_cap > 0,
+    wind_cap  > 0,
+    !is.na(timestamp),
+    !is.na(solar_cf),
+    !is.na(wind_cf)
+  )
+
+cat(sprintf("Clean observations: %d  |  Date range: %s to %s\n",
+            nrow(df), min(df$date), max(df$date)))
+```
+
+## Summary Statistics
+
+```{r summary_table}
+tibble(
+  Variable      = c("Price (EUR/MWh)", "Load (MW)",
+                    "Solar CF", "Wind CF"),
+  Min    = c(min(df$price_eur_mwh), min(df$load_mw),
+             min(df$solar_cf),      min(df$wind_cf)),
+  Mean   = c(mean(df$price_eur_mwh), mean(df$load_mw),
+             mean(df$solar_cf),       mean(df$wind_cf)),
+  Median = c(median(df$price_eur_mwh), median(df$load_mw),
+             median(df$solar_cf),       median(df$wind_cf)),
+  Max    = c(max(df$price_eur_mwh), max(df$load_mw),
+             max(df$solar_cf),       max(df$wind_cf)),
+  SD     = c(sd(df$price_eur_mwh), sd(df$load_mw),
+             sd(df$solar_cf),       sd(df$wind_cf))
+) %>%
+  mutate(across(where(is.numeric), ~ round(.x, 3))) %>%
+  kable(caption = "Descriptive Statistics of Key Variables") %>%
+  kable_styling(bootstrap_options = c("striped","hover","condensed"),
+                full_width = FALSE)
+```
+
+## Raw Time-Series Plots
+
+```{r raw_plots, fig.height=8}
+p_price <- ggplot(df, aes(timestamp, price_eur_mwh)) +
+  geom_line(colour = "#E74C3C", alpha = 0.7, linewidth = 0.4) +
+  labs(title = "Day-Ahead Price", x = NULL, y = "EUR/MWh") +
+  theme_minimal()
+
+p_load <- ggplot(df, aes(timestamp, load_mw / 1e3)) +
+  geom_line(colour = "#2C3E50", alpha = 0.7, linewidth = 0.4) +
+  labs(title = "Actual Load", x = NULL, y = "GW") +
+  theme_minimal()
+
+p_solar <- ggplot(df, aes(timestamp, solar_cf)) +
+  geom_line(colour = "#F39C12", alpha = 0.7, linewidth = 0.4) +
+  labs(title = "Solar Capacity Factor", x = NULL, y = "CF [0-1]") +
+  theme_minimal()
+
+p_wind <- ggplot(df, aes(timestamp, wind_cf)) +
+  geom_line(colour = "#27AE60", alpha = 0.7, linewidth = 0.4) +
+  labs(title = "Wind Capacity Factor", x = NULL, y = "CF [0-1]") +
+  theme_minimal()
+
+gridExtra::grid.arrange(p_price, p_load, p_solar, p_wind, ncol = 1)
+```
+
+---
+
+# Model 1 - Price: Ornstein-Uhlenbeck (Mean-Reverting) Process
+
+## Mathematical Specification
+
+The day-ahead electricity price $P_t$ follows the **Ornstein-Uhlenbeck (OU)** SDE:
+
+$$
+dP_t = \kappa(\mu - P_t)\,dt + \sigma\,dW_t
+$$
+
+| Parameter | Meaning |
+|-----------|---------|
+| $\kappa > 0$ | Speed of mean reversion (higher = faster pull to $\mu$) |
+| $\mu$ | Long-run equilibrium price |
+| $\sigma$ | Instantaneous volatility |
+| $W_t$ | Standard Brownian motion |
+
+**Discrete-time (Euler) representation** - for equally spaced $\Delta t = 1$ hour:
+
+$$
+P_{t+1} = \underbrace{P_t \, e^{-\kappa \Delta t}}_{\text{decay}} +
+           \underbrace{\mu(1 - e^{-\kappa \Delta t})}_{\text{mean pull}} +
+           \underbrace{\sigma\sqrt{\frac{1-e^{-2\kappa\Delta t}}{2\kappa}}\,\varepsilon_t}_{\text{noise}}, \quad
+           \varepsilon_t \sim \mathcal{N}(0,1)
+$$
+
+Equivalently, regressing $P_{t+1}$ on $P_t$:
+
+$$
+P_{t+1} = \alpha + \beta P_t + \eta_t, \quad \eta_t \sim \mathcal{N}(0, \sigma_\eta^2)
+$$
+
+which gives the OLS estimators:
+
+$$
+\hat{\beta} = e^{-\kappa\Delta t}, \quad
+\hat{\alpha} = \mu(1 - \hat{\beta}), \quad
+\hat{\sigma}_\eta^2 = \text{Var}(\eta_t)
+$$
+
+## Parameter Estimation via OLS
+
+```{r ou_price_fit}
+price_ts <- df %>%
+  arrange(timestamp) %>%
+  transmute(
+    P_t  = price_eur_mwh,
+    P_t1 = lead(price_eur_mwh)
+  ) %>%
+  drop_na()
+
+ou_price <- lm(P_t1 ~ P_t, data = price_ts)
+alpha_p  <- coef(ou_price)[1]    # intercept
+beta_p   <- coef(ou_price)[2]    # AR(1) coefficient
+sigma_eta_p <- sigma(ou_price)   # residual SD
+
+# Recover structural OU parameters (Delta t = 1 hour)
+dt_h     <- 1
+kappa_p  <- -log(beta_p) / dt_h
+mu_p     <- alpha_p / (1 - beta_p)
+sigma_p  <- sigma_eta_p * sqrt(2 * kappa_p / (1 - exp(-2 * kappa_p * dt_h)))
+stationary_sd_p <- sigma_eta_p / sqrt(pmax(1 - beta_p^2, 1e-8))
+price_hourly_profile <- df %>%
+  group_by(hour) %>%
+  summarise(mu_price = mean(price_eur_mwh), .groups = "drop") %>%
+  arrange(hour)
+
+cat("=== OU Price Parameters ===\n")
+cat(sprintf("  kappa  (mean reversion speed) = %.4f  [hr^-1]\n", kappa_p))
+cat(sprintf("  mu     (long-run mean price)  = %.4f  [EUR/MWh]\n", mu_p))
+cat(sprintf("  sigma  (volatility)           = %.4f  [EUR/MWh * hr^0.5]\n", sigma_p))
+cat(sprintf("  beta   (AR coefficient)       = %.4f\n", beta_p))
+cat(sprintf("  Half-life                 = %.2f  hours\n", log(2)/kappa_p))
+```
+
+## OU Price: Diagnostics
+
+```{r ou_price_diag, fig.height=6}
+resid_p <- residuals(ou_price)
+
+par(mfrow = c(1, 3))
+
+# Residual histogram vs Normal
+hist(resid_p, breaks = 60, freq = FALSE,
+     main = "Price OU Residuals", xlab = "Residual (EUR/MWh)",
+     col = "#fadbd8", border = "white")
+curve(dnorm(x, 0, sd(resid_p)), add = TRUE, col = "#E74C3C", lwd = 2)
+
+# QQ-plot
+qqnorm(resid_p, main = "QQ-Plot: Price Residuals", pch = 16, cex = 0.4,
+       col = "#E74C3C")
+qqline(resid_p, col = "black", lwd = 2)
+
+# ACF of residuals
+acf(resid_p, main = "ACF: Price OU Residuals", col = "#E74C3C")
+par(mfrow = c(1,1))
+```
+
+## Simulated OU Price Path (24 Hours)
+
+```{r ou_price_sim}
+set.seed(42)
+n_hours <- 24
+P_sim   <- numeric(n_hours)
+P_sim[1] <- rnorm(1, mu_p, stationary_sd_p)   # start from the stationary OU distribution
+
+for (t in 2:n_hours) {
+  noise   <- rnorm(1, 0, sigma_eta_p)
+  P_sim[t] <- alpha_p + beta_p * P_sim[t - 1] + noise
+}
+
+price_sim_df <- tibble(hour = 1:n_hours, price = P_sim)
+
+ggplot(price_sim_df, aes(hour, price)) +
+  geom_line(colour = "#E74C3C", linewidth = 1.2) +
+  geom_hline(yintercept = mu_p, linetype = "dashed", colour = "grey40") +
+  annotate("text", x = 22, y = mu_p + 1, label = sprintf("mu = %.1f EUR/MWh", mu_p),
+           colour = "grey40", size = 3.5) +
+  scale_x_continuous(breaks = 1:24) +
+  labs(title = "Simulated 24-Hour Day-Ahead Price (OU Process)",
+       x = "Hour of Day", y = "Price (EUR/MWh)") +
+  theme_minimal()
+```
+
+---
+
+# Model 2 - Wind: OU Dynamics + Weibull Marginal Distribution
+
+Wind speed is well-described by a **Weibull distribution** in steady state, yet exhibits autocorrelated temporal dynamics captured by an **OU process**.
+
+## Step 2a - OU Process Fit to Wind Capacity Factor
+
+$$
+dC^{\text{wind}}_t = \kappa_w(\mu_w - C^{\text{wind}}_t)\,dt + \sigma_w\,dW_t
+$$
+
+```{r ou_wind_fit}
+wind_ts <- df %>%
+  filter(wind_cf > 0.001, wind_cf < 0.999) %>%
+  arrange(timestamp) %>%
+  transmute(
+    W_t  = wind_cf,
+    W_t1 = lead(wind_cf)
+  ) %>%
+  drop_na()
+
+ou_wind  <- lm(W_t1 ~ W_t, data = wind_ts)
+alpha_w  <- coef(ou_wind)[1]
+beta_w   <- coef(ou_wind)[2]
+sigma_eta_w <- sigma(ou_wind)
+
+kappa_w  <- -log(beta_w) / dt_h
+mu_w     <- alpha_w / (1 - beta_w)
+sigma_w  <- sigma_eta_w * sqrt(2 * kappa_w / (1 - exp(-2 * kappa_w * dt_h)))
+
+cat("=== OU Wind Parameters ===\n")
+cat(sprintf("  kappa  (mean reversion speed) = %.4f  [hr^-1]\n", kappa_w))
+cat(sprintf("  mu     (long-run mean CF)     = %.4f\n", mu_w))
+cat(sprintf("  sigma  (volatility)           = %.4f  [hr^0.5]\n", sigma_w))
+cat(sprintf("  Half-life                 = %.2f  hours\n",   log(2)/kappa_w))
+```
+
+## Step 2b - Weibull Distribution Fit to Wind Capacity Factor
+
+The **Weibull distribution** with shape $k$ and scale $\lambda$ has PDF:
+
+$$
+f(x; k, \lambda) = \frac{k}{\lambda}\left(\frac{x}{\lambda}\right)^{k-1}
+\exp\!\left[-\left(\frac{x}{\lambda}\right)^k\right], \quad x > 0
+$$
+
+**Mean** $= \lambda\,\Gamma(1 + 1/k)$, **Variance** $= \lambda^2\left[\Gamma(1+2/k) - \Gamma^2(1+1/k)\right]$
+
+```{r weibull_wind_fit}
+# Fit Weibull via MLE using strictly positive, non-saturated capacity factors
+wind_cf_fit <- df$wind_cf[df$wind_cf > 0.001 & df$wind_cf < 0.999]
+weib_fit <- fitdistr(wind_cf_fit, densfun = "weibull")
+
+k_w      <- weib_fit$estimate["shape"]
+lambda_w <- weib_fit$estimate["scale"]
+
+cat("=== Weibull Wind Parameters (MLE) ===\n")
+cat(sprintf("  Shape  (k)      = %.4f\n", k_w))
+cat(sprintf("  Scale  (lambda) = %.4f\n", lambda_w))
+cat(sprintf("  Fitted mean     = %.4f\n", lambda_w * gamma(1 + 1/k_w)))
+cat(sprintf("  Empirical mean  = %.4f\n", mean(wind_cf_fit)))
+cat(sprintf("  Log-likelihood  = %.2f\n", weib_fit$loglik))
+```
+
+## Wind Diagnostics
+
+```{r weibull_wind_diag, fig.height=6}
+x_seq <- seq(0.001, 0.999, length.out = 300)
+
+par(mfrow = c(1, 3))
+
+# Histogram + fitted Weibull
+hist(wind_cf_fit, breaks = 50, freq = FALSE, col = "#d5f5e3", border = "white",
+     main = "Wind CF: Weibull Fit", xlab = "Capacity Factor")
+lines(x_seq, dweibull(x_seq, shape = k_w, scale = lambda_w),
+      col = "#27AE60", lwd = 2)
+
+# CDF comparison
+plot(ecdf(wind_cf_fit), main = "Empirical vs Weibull CDF",
+     xlab = "Capacity Factor", col = "#27AE60")
+lines(x_seq, pweibull(x_seq, shape = k_w, scale = lambda_w),
+      col = "#E74C3C", lwd = 2)
+legend("bottomright", c("ECDF", "Weibull"), col = c("#27AE60","#E74C3C"),
+       lwd = 2, bty = "n")
+
+# QQ-plot
+wind_q <- quantile(wind_cf_fit, probs = seq(0.01, 0.99, 0.01))
+weib_q <- qweibull(seq(0.01, 0.99, 0.01), shape = k_w, scale = lambda_w)
+plot(weib_q, wind_q, pch = 16, cex = 0.5, col = "#27AE60",
+     main = "QQ-Plot: Wind vs Weibull",
+     xlab = "Theoretical Quantiles", ylab = "Sample Quantiles")
+abline(0, 1, col = "black", lwd = 2)
+par(mfrow = c(1,1))
+```
+
+## Simulated 24-Hour Wind Profile
+
+```{r wind_sim}
+set.seed(42)
+W_sim      <- numeric(n_hours)
+W_sim[1]   <- mu_w
+
+for (t in 2:n_hours) {
+  W_raw    <- alpha_w + beta_w * W_sim[t-1] + rnorm(1, 0, sigma_eta_w)
+  # Map to Weibull marginal via probability integral transform
+  p_norm   <- pnorm(W_raw, mean = mu_w, sd = sqrt(sigma_eta_w^2 / (1 - beta_w^2)))
+  p_clamp  <- pmax(0.001, pmin(0.999, p_norm))
+  W_sim[t] <- qweibull(p_clamp, shape = k_w, scale = lambda_w)
+}
+
+wind_sim_df <- tibble(hour = 1:n_hours, wind_cf = W_sim)
+
+ggplot(wind_sim_df, aes(hour, wind_cf)) +
+  geom_area(fill = "#27AE60", alpha = 0.3) +
+  geom_line(colour = "#27AE60", linewidth = 1.2) +
+  scale_x_continuous(breaks = 1:24) +
+  scale_y_continuous(limits = c(0, 1), labels = percent) +
+  labs(title = "Simulated 24-Hour Wind Capacity Factor (OU + Weibull)",
+       x = "Hour of Day", y = "Capacity Factor") +
+  theme_minimal()
+```
+
+---
+
+# Model 3 - Load: Hourly Normal Distribution
+
+Electricity demand is modelled as **hour-of-day stratified Normal** to capture diurnal patterns:
+
+$$
+L_h \sim \mathcal{N}(\mu_h^L,\, (\sigma_h^L)^2), \quad h = 0, 1, \ldots, 23
+$$
+
+where $\mu_h^L$ and $\sigma_h^L$ are estimated from all observations in hour $h$.
+
+## Parameter Estimation
+
+```{r normal_load_fit}
+load_params <- df %>%
+  group_by(hour) %>%
+  summarise(
+    mu_load    = mean(load_mw),
+    sigma_load = sd(load_mw),
+    n          = n(),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    ci_lower = mu_load - 1.96 * sigma_load / sqrt(n),
+    ci_upper = mu_load + 1.96 * sigma_load / sqrt(n)
+  )
+
+load_params %>%
+  dplyr::select(Hour = hour, `mu (MW)` = mu_load, `sigma (MW)` = sigma_load,
+         `CI Lower` = ci_lower, `CI Upper` = ci_upper) %>%
+  mutate(across(where(is.numeric), ~ round(.x, 1))) %>%
+  kable(caption = "Hourly Normal Load Parameters") %>%
+  kable_styling(bootstrap_options = c("striped","hover","condensed"),
+                full_width = FALSE)
+```
+
+## Load Diurnal Profile
+
+```{r normal_load_plot}
+ggplot(load_params, aes(hour, mu_load / 1e3)) +
+  geom_ribbon(aes(ymin = (mu_load - sigma_load) / 1e3,
+                  ymax = (mu_load + sigma_load) / 1e3),
+              fill = "#2C3E50", alpha = 0.2) +
+  geom_line(colour = "#2C3E50", linewidth = 1.3) +
+  geom_point(size = 2, colour = "#2C3E50") +
+  scale_x_continuous(breaks = 0:23) +
+  labs(title    = "Hourly Normal Load Distribution - Mean +/- 1 sigma",
+       subtitle = "Shaded region = +/-1 standard deviation",
+       x = "Hour of Day", y = "Load (GW)") +
+  theme_minimal()
+```
+
+## Simulated 24-Hour Load (Normal)
+
+```{r load_sim}
+set.seed(42)
+L_sim <- numeric(n_hours)
+for (h in seq_len(n_hours)) {
+  hr      <- h - 1   # hours 0..23
+  params  <- filter(load_params, hour == hr)
+  L_sim[h] <- rnorm(1, params$mu_load, params$sigma_load)
+}
+L_sim <- pmax(L_sim, 0)
+
+load_sim_df <- tibble(hour = 1:n_hours, load_mw = L_sim)
+
+ggplot(load_sim_df, aes(hour, load_mw / 1e3)) +
+  geom_area(fill = "#2C3E50", alpha = 0.2) +
+  geom_line(colour = "#2C3E50", linewidth = 1.2) +
+  scale_x_continuous(breaks = 1:24) +
+  labs(title = "Simulated 24-Hour Load Profile (Hourly Normal)",
+       x = "Hour of Day", y = "Load (GW)") +
+  theme_minimal()
+```
+
+---
+
+# Model 4 - Solar: Hourly Beta Distribution
+
+Solar capacity factors are bounded in $[0, 1]$ and follow an asymmetric distribution that is zero at night and right-skewed by day. The **Beta distribution** is ideal:
+
+$$
+S_h \sim \text{Beta}(\alpha_h,\, \beta_h), \quad h = 0,\ldots,23
+$$
+
+**PDF:**
+
+$$
+f(x; \alpha, \beta) = \frac{x^{\alpha-1}(1-x)^{\beta-1}}{B(\alpha,\beta)}, \quad x \in (0,1)
+$$
+
+**Method-of-moments estimators** from hourly mean $\bar{s}_h$ and variance $v_h$:
+
+$$
+\hat{\alpha}_h = \bar{s}_h\!\left[\frac{\bar{s}_h(1-\bar{s}_h)}{v_h} - 1\right], \quad
+\hat{\beta}_h  = (1 - \bar{s}_h)\!\left[\frac{\bar{s}_h(1-\bar{s}_h)}{v_h} - 1\right]
+$$
+
+## Parameter Estimation
+
+```{r beta_solar_fit}
+solar_params <- df %>%
+  group_by(hour) %>%
+  summarise(
+    mu_solar  = mean(solar_cf),
+    var_solar = var(solar_cf),
+    n         = n(),
+    .groups   = "drop"
+  ) %>%
+  mutate(
+    # Method-of-moments
+    mu_beta = pmin(pmax(mu_solar, 0.001), 0.999),
+    var_beta = pmax(var_solar, 1e-6),
+    common  = pmax(mu_beta * (1 - mu_beta) / var_beta - 1, 0.1),
+    alpha_s = mu_beta * common,
+    beta_s  = (1 - mu_beta) * common
+  ) %>%
+  # Nighttime hours: very low solar - assign tiny Beta ~ 0
+  mutate(
+    alpha_s = if_else(mu_solar < 0.01, 0.1, alpha_s),
+    beta_s  = if_else(mu_solar < 0.01, 5.0, beta_s)
+  )
+
+solar_params %>%
+  dplyr::select(Hour = hour, `mu` = mu_solar, `Var` = var_solar,
+         `alpha (shape1)` = alpha_s, `beta (shape2)` = beta_s) %>%
+  mutate(across(where(is.numeric), ~ round(.x, 4))) %>%
+  kable(caption = "Hourly Beta Solar Parameters (Method of Moments)") %>%
+  kable_styling(bootstrap_options = c("striped","hover","condensed"),
+                full_width = FALSE)
+```
+
+## Solar Diurnal Profile
+
+```{r beta_solar_plot}
+ggplot(solar_params, aes(hour, mu_solar)) +
+  geom_area(fill = "#F39C12", alpha = 0.3) +
+  geom_line(colour = "#F39C12", linewidth = 1.3) +
+  geom_point(size = 2, colour = "#E67E22") +
+  scale_x_continuous(breaks = 0:23) +
+  scale_y_continuous(labels = percent) +
+  labs(title = "Hourly Mean Solar Capacity Factor (Beta Distribution)",
+       x = "Hour of Day", y = "Mean Capacity Factor") +
+  theme_minimal()
+```
+
+## Beta Fit Diagnostics - Peak Solar Hour
+
+```{r beta_solar_diag, fig.height=5}
+peak_h <- solar_params %>% filter(mu_solar == max(mu_solar)) %>% pull(hour)
+
+solar_peak <- df %>% filter(hour == peak_h, solar_cf > 0.001, solar_cf < 0.999)
+params_peak <- filter(solar_params, hour == peak_h)
+
+x_s <- seq(0.001, 0.999, length.out = 300)
+
+par(mfrow = c(1, 2))
+hist(solar_peak$solar_cf, breaks = 40, freq = FALSE, col = "#fdebd0",
+     border = "white",
+     main = sprintf("Solar CF at Hour %d - Beta Fit", peak_h),
+     xlab = "Capacity Factor")
+lines(x_s, dbeta(x_s, params_peak$alpha_s, params_peak$beta_s),
+      col = "#F39C12", lwd = 2)
+
+# QQ
+empirical_q <- quantile(solar_peak$solar_cf, probs = seq(0.01, 0.99, 0.01))
+theory_q    <- qbeta(seq(0.01, 0.99, 0.01), params_peak$alpha_s, params_peak$beta_s)
+plot(theory_q, empirical_q, pch = 16, cex = 0.5, col = "#F39C12",
+     main = "QQ-Plot: Solar CF vs Beta",
+     xlab = "Theoretical Quantiles", ylab = "Sample Quantiles")
+abline(0, 1, col = "black", lwd = 2)
+par(mfrow = c(1,1))
+```
+
+## Simulated 24-Hour Solar Profile (Beta)
+
+```{r solar_sim}
+set.seed(42)
+S_sim <- numeric(n_hours)
+for (h in seq_len(n_hours)) {
+  hr     <- h - 1
+  params <- filter(solar_params, hour == hr)
+  S_sim[h] <- rbeta(1, params$alpha_s, params$beta_s)
+}
+
+solar_sim_df <- tibble(hour = 1:n_hours, solar_cf = S_sim)
+
+ggplot(solar_sim_df, aes(hour, solar_cf)) +
+  geom_area(fill = "#F39C12", alpha = 0.3) +
+  geom_line(colour = "#F39C12", linewidth = 1.2) +
+  scale_x_continuous(breaks = 1:24) +
+  scale_y_continuous(labels = percent, limits = c(0, 1)) +
+  labs(title = "Simulated 24-Hour Solar Capacity Factor (Hourly Beta)",
+       x = "Hour of Day", y = "Capacity Factor") +
+  theme_minimal()
+```
+
+---
+
+# Battery Dispatch Optimisation Problem
+
+## Problem Formulation
+
+The first phase fits stochastic models to the historical dataset and generates a 24-hour simulated test day. The second phase validates the same battery dispatch logic on an actual 24-hour historical day from the dataset. For each case, the report now solves both the expected-value formulation and the realised-path benchmark so the comparison is internally consistent.
+
+### Decision Variables
+
+| Symbol | Dimension | Description |
+|--------|-----------|-------------|
+| $c_t$ | $[0, C_{\max}]$ MW | Charging power at hour $t$ |
+| $d_t$ | $[0, D_{\max}]$ MW | Discharging power at hour $t$ |
+| $e_t$ | $[0, E_{\max}]$ MWh | State of charge (SoC), indexed from $t=0$ to $T$ |
+| $z_t$ | $\{0,1\}$ | Binary battery mode: 1 = charging allowed, 0 = discharging allowed |
+
+### Objective Function - Expected Net Cost
+
+$$
+\min_{\{c_t,\, d_t,\, e_t,\, z_t\}} \quad
+\mathbb{E}\left[
+\sum_{t=1}^{T} \lambda_t \!\left( L_t - S_t - W_t - d_t + c_t \right)
+\right]
+$$
+
+Using the independence approximation adopted later in the report, this is written as
+
+$$
+\min_{\{c_t,\, d_t,\, e_t,\, z_t\}} \quad
+\sum_{t=1}^{T} \mathbb{E}[\lambda_t]
+\left(
+\mathbb{E}[L_t] - \mathbb{E}[S_t] - \mathbb{E}[W_t] - d_t + c_t
+\right).
+$$
+
+where the fitted mean paths are used for:
+
+- $\mathbb{E}[\lambda_t]$ - expected price [EUR/MWh]
+- $\mathbb{E}[L_t]$ - expected load [MW]
+- $\mathbb{E}[S_t]$ - expected solar generation [MW]
+- $\mathbb{E}[W_t]$ - expected wind generation [MW]
+
+The battery **reduces** net cost by injecting $d_t$ (revenue) and **increases** cost by charging $c_t$ (grid purchase). Because the exogenous term
+$\mathbb{E}[\lambda_t](\mathbb{E}[L_t] - \mathbb{E}[S_t] - \mathbb{E}[W_t])$
+does not depend on the battery decision, the optimiser changes through the expected price path, while expected load, solar, and wind are retained for reporting the full expected system cost.
+
+### Constraints
+
+**1. Energy Balance:**
+$$
+L_t = S_t + W_t + d_t - c_t + G_t, \quad \forall t
+$$
+
+where $G_t \geq 0$ is residual grid import (slack - unconstrained here; battery arbitrages the price).
+
+**2. State-of-Charge Dynamics:**
+$$
+e_t = e_{t-1} + \eta_c \, c_t - \frac{d_t}{\eta_d}, \quad \forall t = 1,\ldots,T
+$$
+
+**3. SoC Bounds:**
+$$
+e_{\min} \leq e_t \leq E_{\max}, \quad \forall t
+$$
+
+**4. Power Bounds:**
+$$
+0 \leq c_t \leq C_{\max}, \quad 0 \leq d_t \leq D_{\max}, \quad \forall t
+$$
+
+**5. Initial & Terminal SoC:**
+$$
+e_0 = e_T = E_0
+$$
+
+**6. No Simultaneous Charge/Discharge (MILP logic):**
+$$
+c_t \leq C_{\max} z_t,\qquad
+d_t \leq D_{\max}(1-z_t), \quad \forall t
+$$
+These binary mode constraints force the battery to be in charge mode, discharge mode, or idle mode in each hour.
+
+### Battery Parameters
+
+```{r battery_params}
+# Battery specification
+E_max   <- 2000   # MWh - usable energy capacity
+E_min   <- 0      # MWh
+E_0     <- 0.5 * E_max  # MWh - initial and terminal SoC (50%)
+C_max   <- 500    # MW - max charge power
+D_max   <- 500    # MW - max discharge power
+eta_c   <- 0.97   # charging efficiency
+eta_d   <- 0.97   # discharging efficiency
+
+cat("=== Battery Parameters ===\n")
+cat(sprintf("  Capacity (E_max)     = %g MWh\n", E_max))
+cat(sprintf("  Max charge power     = %g MW\n",  C_max))
+cat(sprintf("  Max discharge power  = %g MW\n",  D_max))
+cat(sprintf("  Charge efficiency    = %.0f%%\n",  eta_c * 100))
+cat(sprintf("  Discharge efficiency = %.0f%%\n",  eta_d * 100))
+cat(sprintf("  Initial SoC          = %g MWh (%g%%)\n", E_0, 100*E_0/E_max))
+```
+
+## Phase 1: Simulated Scenario from Fitted Models
+
+```{r simulated_scenario_gen}
+set.seed(2025)
+T_sim <- 24
+solar_cap_sim <- median(df$solar_cap, na.rm = TRUE)
+wind_cap_sim  <- median(df$wind_cap,  na.rm = TRUE)
+
+n_price_paths <- 500
+target_spread_quantile <- 0.95
+
+simulate_price_path <- function() {
+  path <- numeric(T_sim)
+  path[1] <- rnorm(1, mu_p, stationary_sd_p)
+  for (t in 2:T_sim) {
+    path[t] <- alpha_p + beta_p * path[t - 1] + rnorm(1, 0, sigma_eta_p)
+  }
+  path
+}
+
+price_bank <- replicate(n_price_paths, simulate_price_path(), simplify = FALSE)
+price_spreads <- vapply(price_bank, function(x) max(x) - min(x), numeric(1))
+target_spread <- as.numeric(quantile(price_spreads, target_spread_quantile, na.rm = TRUE))
+selected_price_path <- which.min(abs(price_spreads - target_spread))
+sim_lam <- price_bank[[selected_price_path]]
+
+sim_w_cf <- numeric(T_sim)
+sim_w_cf[1] <- mu_w
+for (t in 2:T_sim) {
+  w_raw <- alpha_w + beta_w * sim_w_cf[t - 1] + rnorm(1, 0, sigma_eta_w)
+  p_u <- pnorm(w_raw, mu_w, sqrt(sigma_eta_w^2 / (1 - beta_w^2)))
+  sim_w_cf[t] <- qweibull(pmax(1e-4, pmin(1 - 1e-4, p_u)), k_w, lambda_w)
+}
+sim_w_gen <- sim_w_cf * wind_cap_sim
+
+sim_l_gen <- numeric(T_sim)
+for (t in seq_len(T_sim)) {
+  hr <- t - 1
+  p <- filter(load_params, hour == hr)
+  sim_l_gen[t] <- max(0, rnorm(1, p$mu_load, p$sigma_load))
+}
+
+sim_s_cf <- numeric(T_sim)
+for (t in seq_len(T_sim)) {
+  hr <- t - 1
+  p <- filter(solar_params, hour == hr)
+  sim_s_cf[t] <- rbeta(1, p$alpha_s, p$beta_s)
+}
+sim_s_gen <- sim_s_cf * solar_cap_sim
+
+sim_scenario_df <- tibble(
+  hour      = 1:T_sim,
+  price     = sim_lam,
+  load_mw   = sim_l_gen,
+  solar_mw  = sim_s_gen,
+  wind_mw   = sim_w_gen,
+  solar_cap = rep(solar_cap_sim, T_sim),
+  wind_cap  = rep(wind_cap_sim,  T_sim),
+  net_load  = sim_l_gen - sim_s_gen - sim_w_gen
+)
+
+cat(sprintf(
+  "Selected simulated day: path %d/%d | price spread: %.2f EUR/MWh (%.0fth percentile)\n",
+  selected_price_path, n_price_paths, price_spreads[selected_price_path],
+  100 * target_spread_quantile
+))
+
+sim_scenario_df %>%
+  dplyr::select(hour, price, load_mw, solar_mw, wind_mw, net_load) %>%
+  mutate(across(where(is.numeric), ~ round(.x, 2))) %>%
+  kable(caption = "24-Hour Simulated Scenario Used for Battery Dispatch") %>%
+  kable_styling(bootstrap_options = c("striped","hover","condensed"),
+                full_width = FALSE) %>%
+  scroll_box(height = "350px")
+```
+
+## Phase 2: Historical Scenario from Real Dataset
+
+```{r real_scenario_gen}
+# Use actual hourly observations from the provided 2019 dataset for validation.
+# We pick the complete historical day with the largest intraday price spread,
+# because that is the strongest real-life arbitrage test case.
+historical_days <- df %>%
+  group_by(date) %>%
+  summarise(
+    n_hours      = n(),
+    price_min    = min(price_eur_mwh, na.rm = TRUE),
+    price_max    = max(price_eur_mwh, na.rm = TRUE),
+    price_spread = price_max - price_min,
+    avg_price    = mean(price_eur_mwh, na.rm = TRUE),
+    avg_load_mw  = mean(load_mw, na.rm = TRUE),
+    avg_solar_mw = mean(solar_mw, na.rm = TRUE),
+    avg_wind_mw  = mean(wind_mw, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  filter(n_hours >= 24, is.finite(price_spread))
+
+selected_day_info <- historical_days %>%
+  arrange(desc(price_spread)) %>%
+  slice(1)
+
+validation_date <- selected_day_info$date[1]
+
+real_scenario_df <- df %>%
+  filter(date == validation_date) %>%
+  arrange(timestamp) %>%
+  slice_head(n = 24) %>%
+  transmute(
+    hour      = row_number(),
+    timestamp,
+    date,
+    price     = price_eur_mwh,
+    load_mw,
+    solar_mw,
+    wind_mw,
+    solar_cap,
+    wind_cap,
+    net_load  = load_mw - solar_mw - wind_mw
+  )
+
+if (nrow(real_scenario_df) != 24) {
+  stop("Historical validation scenario must contain 24 hourly observations.")
+}
+
+selected_day_info %>%
+  mutate(across(where(is.numeric), ~ round(.x, 2))) %>%
+  kable(caption = "Selected Real-Life Validation Day") %>%
+  kable_styling(bootstrap_options = c("striped","hover","condensed"),
+                full_width = FALSE)
+
+real_scenario_df %>%
+  dplyr::select(hour, timestamp, price, load_mw, solar_mw, wind_mw, net_load) %>%
+  mutate(across(where(is.numeric), ~ round(.x, 2))) %>%
+  kable(caption = "24-Hour Real Historical Scenario Used for Battery Dispatch") %>%
+  kable_styling(bootstrap_options = c("striped","hover","condensed"),
+                full_width = FALSE) %>%
+  scroll_box(height = "350px")
+```
+## LP Formulation & Solution
+
+The mixed-integer formulation below is solved in four versions: simulated and real scenarios, each under both the expected-value objective and the realised-path benchmark.
+
+```{r lp_solve}
+build_expected_scenario <- function(scenario_input) {
+  scenario_input <- scenario_input %>%
+    arrange(hour)
+
+  T_eval <- nrow(scenario_input)
+  if (T_eval != 24) {
+    stop("Expected-value scenario must contain 24 hourly observations.")
+  }
+
+  expected_price_baseline <- price_hourly_profile$mu_price
+  expected_price <- expected_price_baseline +
+    beta_p^(0:(T_eval - 1)) * (scenario_input$price[1] - expected_price_baseline[1])
+  expected_load  <- load_params %>% arrange(hour) %>% pull(mu_load)
+  expected_solar_cf <- solar_params %>% arrange(hour) %>% pull(mu_solar)
+  expected_wind_cf  <- rep(lambda_w * gamma(1 + 1 / k_w), T_eval)
+
+  scenario_input %>%
+    mutate(
+      price    = expected_price,
+      load_mw  = expected_load,
+      solar_mw = expected_solar_cf * solar_cap,
+      wind_mw  = expected_wind_cf * wind_cap,
+      net_load = load_mw - solar_mw - wind_mw
+    )
+}
+
+solve_dispatch_milp <- function(scenario_input, scenario_group, objective_basis) {
+  scenario_input <- scenario_input %>%
+    arrange(hour)
+
+  T <- nrow(scenario_input)
+  tol <- 1e-6
+
+  # Variable ordering: [c_1..c_T, d_1..d_T, e_0..e_T, z_1..z_T]
+  idx_c <- 1:T
+  idx_d <- (T + 1):(2 * T)
+  idx_e <- (2 * T + 1):(3 * T + 1)
+  idx_z <- (3 * T + 2):(4 * T + 1)
+  n_var <- 4 * T + 1
+
+  obj <- rep(0, n_var)
+  obj[idx_c] <- scenario_input$price
+  obj[idx_d] <- -scenario_input$price
+
+  con_mat <- matrix(0, nrow = 0, ncol = n_var)
+  con_dir <- character(0)
+  con_rhs <- numeric(0)
+
+  add_con <- function(row, dir, rhs) {
+    con_mat <<- rbind(con_mat, row)
+    con_dir <<- c(con_dir, dir)
+    con_rhs <<- c(con_rhs, rhs)
+  }
+
+  for (t in 1:T) {
+    row <- rep(0, n_var)
+    row[idx_e[t]]   <-  1
+    row[idx_e[t + 1]] <- -1
+    row[idx_c[t]]   <-  eta_c
+    row[idx_d[t]]   <- -1 / eta_d
+    add_con(row, "=", 0)
+  }
+
+  row <- rep(0, n_var)
+  row[idx_e[1]] <- 1
+  add_con(row, "=", E_0)
+
+  row <- rep(0, n_var)
+  row[idx_e[T + 1]] <- 1
+  add_con(row, "=", E_0)
+
+  for (t in seq_along(idx_e)) {
+    row <- rep(0, n_var)
+    row[idx_e[t]] <- 1
+    add_con(row, "<=", E_max)
+  }
+
+  for (t in seq_along(idx_e)) {
+    row <- rep(0, n_var)
+    row[idx_e[t]] <- 1
+    add_con(row, ">=", E_min)
+  }
+
+  for (t in 1:T) {
+    row <- rep(0, n_var)
+    row[idx_c[t]] <- 1
+    row[idx_z[t]] <- -C_max
+    add_con(row, "<=", 0)
+  }
+
+  for (t in 1:T) {
+    row <- rep(0, n_var)
+    row[idx_d[t]] <- 1
+    row[idx_z[t]] <- D_max
+    add_con(row, "<=", D_max)
+  }
+
+  lp_result <- lpSolve::lp(
+    direction    = "min",
+    objective.in = obj,
+    const.mat    = con_mat,
+    const.dir    = con_dir,
+    const.rhs    = con_rhs,
+    binary.vec   = idx_z
+  )
+
+  if (lp_result$status != 0) {
+    stop(
+      "Dispatch MILP did not find an optimal solution for ",
+      scenario_group,
+      " (",
+      objective_basis,
+      "). Solver status: ",
+      lp_result$status
+    )
+  }
+
+  sol <- lp_result$solution
+  c_opt <- sol[idx_c]
+  d_opt <- sol[idx_d]
+  e_opt <- sol[idx_e[-1]]
+
+  c_opt[abs(c_opt) < tol] <- 0
+  d_opt[abs(d_opt) < tol] <- 0
+  e_opt[abs(e_opt) < tol] <- 0
+
+  results_df <- scenario_input %>%
+    mutate(
+      scenario = scenario_group,
+      objective_basis = objective_basis,
+      schedule_label = paste(scenario_group, objective_basis, sep = " | "),
+      charge_mw = c_opt,
+      discharge_mw = d_opt,
+      soc_mwh = e_opt,
+      operating_mode = case_when(
+        charge_mw > tol ~ "Charge",
+        discharge_mw > tol ~ "Discharge",
+        TRUE ~ "Idle"
+      ),
+      simultaneous_flag = charge_mw > tol & discharge_mw > tol,
+      net_battery = discharge_mw - charge_mw,
+      charge_cost = price * charge_mw,
+      discharge_revenue = price * discharge_mw,
+      battery_profit = discharge_revenue - charge_cost,
+      cost_no_batt = price * net_load,
+      cost_w_batt = price * (net_load + charge_mw - discharge_mw)
+    )
+
+  reference_date <- if ("date" %in% names(scenario_input) && any(!is.na(scenario_input$date))) {
+    as.character(dplyr::first(scenario_input$date))
+  } else {
+    "Simulated"
+  }
+
+  summary_tbl <- tibble(
+    scenario = scenario_group,
+    objective_basis = objective_basis,
+    schedule_label = paste(scenario_group, objective_basis, sep = " | "),
+    reference_date = reference_date,
+    total_no_batt = sum(results_df$cost_no_batt, na.rm = TRUE),
+    total_w_batt = sum(results_df$cost_w_batt, na.rm = TRUE),
+    absolute_saving = sum(results_df$cost_no_batt, na.rm = TRUE) - sum(results_df$cost_w_batt, na.rm = TRUE),
+    pct_savings = 100 * (sum(results_df$cost_no_batt, na.rm = TRUE) - sum(results_df$cost_w_batt, na.rm = TRUE)) / abs(sum(results_df$cost_no_batt, na.rm = TRUE)),
+    total_discharge_revenue = sum(results_df$discharge_revenue, na.rm = TRUE),
+    total_charge_cost = sum(results_df$charge_cost, na.rm = TRUE),
+    battery_arbitrage_profit = sum(results_df$battery_profit, na.rm = TRUE),
+    profit_per_mwh_capacity = sum(results_df$battery_profit, na.rm = TRUE) / E_max,
+    price_spread = max(results_df$price, na.rm = TRUE) - min(results_df$price, na.rm = TRUE),
+    charge_hours = sum(results_df$charge_mw > tol),
+    discharge_hours = sum(results_df$discharge_mw > tol),
+    idle_hours = sum(results_df$operating_mode == "Idle"),
+    simultaneous_hours = sum(results_df$simultaneous_flag)
+  )
+
+  list(
+    scenario_group = scenario_group,
+    objective_basis = objective_basis,
+    lp_result = lp_result,
+    results_df = results_df,
+    summary_tbl = summary_tbl
+  )
+}
+
+evaluate_fixed_dispatch <- function(dispatch_obj, evaluation_input, evaluation_basis) {
+  tol <- 1e-6
+  schedule_df <- dispatch_obj$results_df %>%
+    arrange(hour)
+  evaluation_input <- evaluation_input %>%
+    arrange(hour)
+
+  if (nrow(schedule_df) != nrow(evaluation_input)) {
+    stop("Schedule and evaluation input must have the same horizon.")
+  }
+
+  total_no_batt <- sum(evaluation_input$price * evaluation_input$net_load, na.rm = TRUE)
+  total_w_batt  <- sum(
+    evaluation_input$price * (
+      evaluation_input$net_load + schedule_df$charge_mw - schedule_df$discharge_mw
+    ),
+    na.rm = TRUE
+  )
+
+  tibble(
+    scenario = dispatch_obj$scenario_group,
+    schedule_basis = dispatch_obj$objective_basis,
+    evaluation_basis = evaluation_basis,
+    battery_arbitrage_profit = sum(
+      evaluation_input$price * (schedule_df$discharge_mw - schedule_df$charge_mw),
+      na.rm = TRUE
+    ),
+    absolute_saving = total_no_batt - total_w_batt,
+    pct_savings = 100 * (total_no_batt - total_w_batt) / abs(total_no_batt),
+    total_no_batt = total_no_batt,
+    total_w_batt = total_w_batt,
+    price_mean = mean(evaluation_input$price, na.rm = TRUE),
+    price_spread = max(evaluation_input$price, na.rm = TRUE) - min(evaluation_input$price, na.rm = TRUE),
+    charge_hours = sum(schedule_df$charge_mw > tol),
+    discharge_hours = sum(schedule_df$discharge_mw > tol),
+    idle_hours = sum(schedule_df$operating_mode == "Idle")
+  )
+}
+
+sim_expected_scenario_df  <- build_expected_scenario(sim_scenario_df)
+real_expected_scenario_df <- build_expected_scenario(real_scenario_df)
+
+sim_dispatch_realised  <- solve_dispatch_milp(sim_scenario_df,           "Simulated",       "Realised Path")
+real_dispatch_realised <- solve_dispatch_milp(real_scenario_df,          "Real Historical", "Realised Path")
+sim_dispatch_expected  <- solve_dispatch_milp(sim_expected_scenario_df,  "Simulated",       "Expected Value")
+real_dispatch_expected <- solve_dispatch_milp(real_expected_scenario_df, "Real Historical", "Expected Value")
+
+dispatch_comparison <- bind_rows(
+  sim_dispatch_expected$summary_tbl,
+  real_dispatch_expected$summary_tbl,
+  sim_dispatch_realised$summary_tbl,
+  real_dispatch_realised$summary_tbl
+) %>%
+  mutate(
+    objective_basis = factor(objective_basis, levels = c("Expected Value", "Realised Path")),
+    scenario = factor(scenario, levels = c("Simulated", "Real Historical"))
+  ) %>%
+  arrange(scenario, objective_basis)
+
+results_df <- real_dispatch_realised$results_df
+battery_arbitrage_profit <- real_dispatch_realised$summary_tbl$battery_arbitrage_profit[[1]]
+pct_savings <- real_dispatch_realised$summary_tbl$pct_savings[[1]]
+expected_profit_sim <- sim_dispatch_expected$summary_tbl$battery_arbitrage_profit[[1]]
+expected_profit_real <- real_dispatch_expected$summary_tbl$battery_arbitrage_profit[[1]]
+realised_profit_sim <- sim_dispatch_realised$summary_tbl$battery_arbitrage_profit[[1]]
+realised_profit_real <- real_dispatch_realised$summary_tbl$battery_arbitrage_profit[[1]]
+```
+
+## Dispatch Schedules
+
+```{r lp_results}
+sim_dispatch_realised$results_df %>%
+  dplyr::select(
+    Hour = hour,
+    `Price (EUR/MWh)` = price,
+    `Load (MW)` = load_mw,
+    `Solar (MW)` = solar_mw,
+    `Wind (MW)` = wind_mw,
+    `Charge (MW)` = charge_mw,
+    `Discharge (MW)` = discharge_mw,
+    `SoC (MWh)` = soc_mwh,
+    Mode = operating_mode
+  ) %>%
+  mutate(across(where(is.numeric), ~ round(.x, 2))) %>%
+  kable(caption = "Path-Wise Optimal 24-Hour Battery Dispatch - Simulated Scenario") %>%
+  kable_styling(bootstrap_options = c("striped","hover","condensed"),
+                full_width = FALSE) %>%
+  scroll_box(height = "350px")
+
+real_dispatch_realised$results_df %>%
+  dplyr::select(
+    Hour = hour,
+    `Price (EUR/MWh)` = price,
+    `Load (MW)` = load_mw,
+    `Solar (MW)` = solar_mw,
+    `Wind (MW)` = wind_mw,
+    `Charge (MW)` = charge_mw,
+    `Discharge (MW)` = discharge_mw,
+    `SoC (MWh)` = soc_mwh,
+    Mode = operating_mode
+  ) %>%
+  mutate(across(where(is.numeric), ~ round(.x, 2))) %>%
+  kable(caption = "Path-Wise Optimal 24-Hour Battery Dispatch - Real Historical Scenario") %>%
+  kable_styling(bootstrap_options = c("striped","hover","condensed"),
+                full_width = FALSE) %>%
+  scroll_box(height = "350px")
+```
+
+## Visualise Simulated vs Real Dispatch
+
+```{r dispatch_plot, fig.height=11}
+comparison_results_df <- bind_rows(
+  sim_dispatch_expected$results_df,
+  real_dispatch_expected$results_df,
+  sim_dispatch_realised$results_df,
+  real_dispatch_realised$results_df
+) %>%
+  mutate(
+    scenario = factor(scenario, levels = c("Simulated", "Real Historical")),
+    objective_basis = factor(objective_basis, levels = c("Expected Value", "Realised Path"))
+  )
+
+p1 <- ggplot(comparison_results_df, aes(hour)) +
+  geom_col(aes(y = charge_mw), fill = "#3498DB", alpha = 0.8) +
+  geom_col(aes(y = -discharge_mw), fill = "#E74C3C", alpha = 0.8) +
+  geom_line(aes(y = price), colour = "#8E44AD", linewidth = 1.1) +
+  geom_point(aes(y = price), colour = "#8E44AD", size = 1.8) +
+  facet_grid(objective_basis ~ scenario, scales = "free_y") +
+  scale_x_continuous(breaks = 1:24) +
+  labs(
+    title = "Battery Dispatch Under Expected-Value and Realised-Path Objectives",
+    subtitle = "Blue = charge, red = discharge, purple = price",
+    x = "Hour",
+    y = "Battery Power / Price"
+  ) +
+  theme_minimal()
+
+p2 <- ggplot(comparison_results_df, aes(hour, soc_mwh)) +
+  geom_area(fill = "#3498DB", alpha = 0.25) +
+  geom_line(colour = "#2980B9", linewidth = 1.1) +
+  geom_point(colour = "#2980B9", size = 1.8) +
+  facet_grid(objective_basis ~ scenario) +
+  scale_x_continuous(breaks = 1:24) +
+  scale_y_continuous(limits = c(0, E_max + 50)) +
+  labs(
+    title = "Battery State of Charge Across Both Formulations",
+    x = "Hour",
+    y = "SoC (MWh)"
+  ) +
+  theme_minimal()
+
+p3 <- dispatch_comparison %>%
+  ggplot(aes(scenario, battery_arbitrage_profit / 1e3, fill = objective_basis)) +
+  geom_col(width = 0.65, alpha = 0.85, position = position_dodge(width = 0.75)) +
+  geom_text(
+    aes(label = sprintf("%.1f", battery_arbitrage_profit / 1e3)),
+    position = position_dodge(width = 0.75),
+    vjust = -0.4,
+    size = 3.2
+  ) +
+  labs(
+    title = "Arbitrage Profit by Formulation",
+    x = NULL,
+    y = "Profit (thousand EUR)"
+  ) +
+  theme_minimal()
+
+gridExtra::grid.arrange(p1, p2, p3, ncol = 1)
+```
+
+## Simulated vs Real Comparison
+
+```{r cost_savings}
+dispatch_comparison %>%
+  transmute(
+    Scenario = scenario,
+    `Objective Basis` = objective_basis,
+    `Reference Date` = reference_date,
+    `No Battery Cost (EUR)` = sprintf("EUR %.2f", total_no_batt),
+    `With Battery Cost (EUR)` = sprintf("EUR %.2f", total_w_batt),
+    `Absolute Saving (EUR)` = sprintf("EUR %.2f", absolute_saving),
+    `Percentage Saving` = sprintf("%.2f %%", pct_savings),
+    `Battery Arbitrage Profit (EUR)` = sprintf("EUR %.2f", battery_arbitrage_profit),
+    `Profit per MWh Capacity` = sprintf("EUR %.2f / MWh", profit_per_mwh_capacity),
+    `Price Spread` = sprintf("%.2f EUR/MWh", price_spread),
+    `Charge Hours` = charge_hours,
+    `Discharge Hours` = discharge_hours,
+    `Idle Hours` = idle_hours,
+    `Simultaneous Hours` = simultaneous_hours
+  ) %>%
+  kable(caption = "Battery Dispatch Comparison Across Expected-Value and Realised-Path Formulations") %>%
+  kable_styling(bootstrap_options = c("striped","hover","condensed"),
+                full_width = FALSE)
+```
+
+---
+
+# Summary of All Model Parameters
+
+```{r param_summary}
+tibble(
+  Variable = c("Price", "Price", "Price",
+               "Wind (OU)", "Wind (OU)", "Wind (OU)",
+               "Wind (Weibull)", "Wind (Weibull)",
+               "Load (Normal - hourly)", "Solar (Beta - hourly)"),
+  Parameter = c("kappa (mean reversion speed)", "mu (long-run mean)", "sigma (volatility)",
+                "kappa (mean reversion speed)", "mu (long-run mean CF)", "sigma (volatility)",
+                "Shape k", "Scale lambda",
+                "mu_h, sigma_h per hour",
+                "alpha_h, beta_h per hour"),
+  Estimate = c(
+    round(kappa_p, 4), round(mu_p, 4), round(sigma_p, 4),
+    round(kappa_w, 4), round(mu_w, 4), round(sigma_w, 4),
+    round(k_w, 4), round(lambda_w, 4),
+    "- see Table 4 -",
+    "- see Table 5 -"
+  ),
+  Distribution = c(rep("Ornstein-Uhlenbeck", 3),
+                   rep("Ornstein-Uhlenbeck", 3),
+                   rep("Weibull", 2),
+                   "Normal",
+                   "Beta")
+) %>%
+  kable(caption = "Consolidated Model Parameter Table") %>%
+  kable_styling(bootstrap_options = c("striped","hover","condensed"),
+                full_width = FALSE) %>%
+  pack_rows("Price Model (OU)", 1, 3) %>%
+  pack_rows("Wind Model (OU)", 4, 6) %>%
+  pack_rows("Wind Model (Weibull Marginal)", 7, 8) %>%
+  pack_rows("Load Model", 9, 9) %>%
+  pack_rows("Solar Model", 10, 10)
+```
+
+---
+
+# Expected-Value Dispatch Comparison
+
+The correction required here is that the expected-value objective must be solved first, not only evaluated afterwards. For each scenario, the report therefore builds a fitted mean path, solves the expected-value MILP on that mean path, and then cross-evaluates both schedules on both input sets.
+
+For price, the expected path combines the fitted hourly mean profile with OU mean reversion:
+
+$$
+\mathbb{E}[\lambda_t \mid \lambda_1]
+:=
+\bar{\lambda}_{h(t)} + \beta_p^{\,t-1}\!\left(\lambda_1 - \bar{\lambda}_{h(1)}\right),
+$$
+
+where $\bar{\lambda}_{h(t)}$ is the fitted mean day-ahead price for hour $h(t)$. The expected load, solar, and wind paths come from the fitted hourly Normal mean, hourly Beta mean, and Weibull mean respectively. These expected renewable and load terms matter for total expected system cost even though the dispatch argmin itself is driven by expected prices.
+
+```{r expected_value_comparison}
+dispatch_cross_evaluation <- bind_rows(
+  evaluate_fixed_dispatch(sim_dispatch_realised,  sim_scenario_df,           "Realised Path"),
+  evaluate_fixed_dispatch(sim_dispatch_realised,  sim_expected_scenario_df,  "Expected Value"),
+  evaluate_fixed_dispatch(sim_dispatch_expected,  sim_scenario_df,           "Realised Path"),
+  evaluate_fixed_dispatch(sim_dispatch_expected,  sim_expected_scenario_df,  "Expected Value"),
+  evaluate_fixed_dispatch(real_dispatch_realised, real_scenario_df,          "Realised Path"),
+  evaluate_fixed_dispatch(real_dispatch_realised, real_expected_scenario_df, "Expected Value"),
+  evaluate_fixed_dispatch(real_dispatch_expected, real_scenario_df,          "Realised Path"),
+  evaluate_fixed_dispatch(real_dispatch_expected, real_expected_scenario_df, "Expected Value")
+)
+
+dispatch_cross_summary <- dispatch_cross_evaluation %>%
+  mutate(
+    scenario = factor(scenario, levels = c("Simulated", "Real Historical")),
+    schedule_key = if_else(schedule_basis == "Realised Path", "realised_schedule", "expected_schedule"),
+    evaluation_key = if_else(evaluation_basis == "Realised Path", "on_realised_inputs", "on_expected_inputs")
+  ) %>%
+  dplyr::select(
+    scenario,
+    schedule_key,
+    evaluation_key,
+    battery_arbitrage_profit,
+    absolute_saving
+  ) %>%
+  pivot_wider(
+    names_from = c(schedule_key, evaluation_key),
+    values_from = c(battery_arbitrage_profit, absolute_saving),
+    names_glue = "{schedule_key}_{evaluation_key}_{.value}"
+  )
+
+dispatch_cross_summary %>%
+  transmute(
+    Scenario = scenario,
+    `Realised-Schedule Profit on Realised Inputs (EUR)` =
+      sprintf("EUR %.2f", realised_schedule_on_realised_inputs_battery_arbitrage_profit),
+    `Realised-Schedule Profit on Expected Inputs (EUR)` =
+      sprintf("EUR %.2f", realised_schedule_on_expected_inputs_battery_arbitrage_profit),
+    `Expected-Schedule Profit on Realised Inputs (EUR)` =
+      sprintf("EUR %.2f", expected_schedule_on_realised_inputs_battery_arbitrage_profit),
+    `Expected-Schedule Profit on Expected Inputs (EUR)` =
+      sprintf("EUR %.2f", expected_schedule_on_expected_inputs_battery_arbitrage_profit),
+    `Realised-Schedule Saving on Realised Inputs (EUR)` =
+      sprintf("EUR %.2f", realised_schedule_on_realised_inputs_absolute_saving),
+    `Realised-Schedule Saving on Expected Inputs (EUR)` =
+      sprintf("EUR %.2f", realised_schedule_on_expected_inputs_absolute_saving),
+    `Expected-Schedule Saving on Realised Inputs (EUR)` =
+      sprintf("EUR %.2f", expected_schedule_on_realised_inputs_absolute_saving),
+    `Expected-Schedule Saving on Expected Inputs (EUR)` =
+      sprintf("EUR %.2f", expected_schedule_on_expected_inputs_absolute_saving)
+  ) %>%
+  kable(caption = "Cross-Evaluation of Realised-Path and Expected-Value Dispatches") %>%
+  kable_styling(bootstrap_options = c("striped","hover","condensed"),
+                full_width = FALSE)
+```
+
+The table above does the comparison the report needs:
+
+1. It solves the expected-value objective directly.
+2. It keeps the realised-path solve as a benchmark.
+3. It compares both schedules on realised inputs and on expected inputs.
+
+---
+
+# Conclusion
+
+This analysis developed a complete stochastic energy dispatch framework, solved it on both a simulated 24-hour day and a real historical validation day, and compared the expected-value and realised-path dispatches for a 2,000 MWh / 500 MW battery:
+
+1. **Price** was modelled as an OU process with mean-reversion speed $\kappa =$ `r round(kappa_p,3)` hr^-1 and long-run mean $\mu =$ `r round(mu_p,2)` EUR/MWh, capturing the well-known tendency of electricity prices to revert to a fundamental level.
+
+2. **Wind** was modelled in two stages: (a) an OU process to capture temporal autocorrelation ($\kappa_w =$ `r round(kappa_w,3)` hr^-1), and (b) a Weibull marginal distribution (shape $k =$ `r round(k_w,3)`, scale $\lambda =$ `r round(lambda_w,3)`) to capture the characteristic right-skewed shape of wind speed distributions.
+
+3. **Load** was modelled as an hourly stratified Normal distribution, capturing the familiar morning ramp and evening peak patterns.
+
+4. **Solar** was modelled as an hourly stratified Beta distribution, which is well suited to bounded capacity factors with zero-inflated parameters at night and unimodal daytime profiles.
+
+5. The **battery dispatch MILP** was solved under both formulations. On the realised-path benchmark, the selected real day delivered battery arbitrage profit of **`r sprintf("EUR %.2f", battery_arbitrage_profit)`** and a system cost saving of **`r sprintf("%.2f%%", pct_savings)`** relative to the no-battery baseline.
+
+6. Under the corrected **expected-value formulation**, the simulated case yields battery arbitrage profit of **`r sprintf("EUR %.2f", expected_profit_sim)`**, while the real historical case yields **`r sprintf("EUR %.2f", expected_profit_real)`**. The realised-path benchmark gives **`r sprintf("EUR %.2f", realised_profit_sim)`** and **`r sprintf("EUR %.2f", realised_profit_real)`** respectively, so the final comparison now cleanly shows the effect of taking expectation before solving.
+
+---
+
+*Generated in R with `lpSolve`, `fitdistrplus`, `MASS`, and `tidyverse`.*
